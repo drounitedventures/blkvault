@@ -1,5 +1,17 @@
-# (Place at project root)
-
+# (Place at project root)/requirements.txt/requirements.txt
+/server.py
+/auth.py
+/kv_agents.py
+/.env.example
+/web/index.html
+/web/manifest.webmanifest
+/web/sw.js/server.py
+/auth.py
+/kv_agents.py
+/.env.example
+/web/index.html
+/web/manifest.webmanifest
+/web/sw.js
 fastapi>=0.112.0
 uvicorn>=0.30.1
 python-dotenv>=1.0.1
