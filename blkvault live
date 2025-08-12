@@ -1,0 +1,771 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# BlackVault — Full Repo (drop‑in)
+# Paste these files into a folder named `blackvault/`, commit to GitHub, and deploy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# =========================
+# requirements.txt
+# =========================
+# (Place at project root)
+
+fastapi>=0.112.0
+uvicorn>=0.30.1
+python-dotenv>=1.0.1
+rich>=13.7.1
+httpx>=0.27.0
+pydantic>=2.7.0
+sqlmodel>=0.0.21
+apscheduler>=3.10.4
+itsdangerous>=2.2.0
+requests>=2.32.3
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+readability-lxml>=0.8.1
+Unidecode>=1.3.8
+openai>=1.40.0
+notion-client>=2.2.1
+sendgrid>=6.11.0
+
+
+# =========================
+# .env.example
+# =========================
+# (Copy to .env and fill in values; do not commit secrets.)
+
+# Core
+APP_SECRET=change-me
+APP_USERNAME=kadendro
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+
+# Square (optional now; add later)
+SQUARE_ACCESS_TOKEN=
+SQUARE_LOCATION_ID=
+SQUARE_WEBHOOK_SIGNATURE_KEY=
+
+# Notion (optional)
+NOTION_API_KEY=
+NOTION_DB_LEADS=
+NOTION_DB_DEALS=
+NOTION_DB_CLIENTS=
+
+# SendGrid (optional)
+SENDGRID_API_KEY=
+SENDER_EMAIL=
+
+# Twilio (optional)
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_CALLER_ID=
+
+
+# =========================
+# kv_agents.py
+# =========================
+from __future__ import annotations
+import os, json, re
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional
+from dotenv import load_dotenv
+from unidecode import unidecode
+import requests
+from bs4 import BeautifulSoup
+
+load_dotenv()
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# ---- LLM helper ---------------------------------------------------------
+
+def client():
+    if OpenAI is None:
+        raise RuntimeError("openai library not installed")
+    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def chat(messages, model: str = DEFAULT_MODEL, temperature: float = 0.2, tools=None):
+    c = client()
+    resp = c.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        tools=tools or None,
+        tool_choice="auto" if tools else None,
+    )
+    return resp.choices[0].message
+
+# ---- Web tools ----------------------------------------------------------
+
+class WebTool:
+    def fetch(self, url: str) -> str:
+        try:
+            html = requests.get(url, timeout=30).text
+            soup = BeautifulSoup(html, "lxml")
+            for t in soup(["script","style","noscript"]): t.decompose()
+            txt = unidecode(soup.get_text(" \n "))
+            return re.sub(r"\n\s*\n+", "\n\n", txt)[:12000]
+        except Exception as e:
+            return f"(fetch error {e})"
+
+web = WebTool()
+
+# ---- Agent base ---------------------------------------------------------
+
+@dataclass
+class Agent:
+    name: str
+    system_prompt: str
+    tools: Dict[str, Any] = field(default_factory=dict)
+    model: str = DEFAULT_MODEL
+
+    def run(self, task: str, context: str = "", extra: Optional[Dict[str,Any]] = None):
+        messages = [
+            {"role":"system", "content": self.system_prompt},
+            {"role":"user", "content": json.dumps({"task": task, "context": context, "extra": extra or {}}, ensure_ascii=False)},
+        ]
+        tool_defs = []
+        for key, fn in self.tools.items():
+            tool_defs.append({"type":"function","function":{"name":key,"description":key,"parameters":{"type":"object","properties":{"args":{"type":"object"}}}}})
+        msg = chat(messages, model=self.model, tools=tool_defs or None)
+        out = {"content": msg.content or "", "tool_calls": []}
+        if msg.tool_calls:
+            import json as _json
+            for call in msg.tool_calls:
+                name = call.function.name
+                args = _json.loads(call.function.arguments or '{}').get("args", {})
+                fn = self.tools.get(name)
+                res = fn(**args) if fn else None
+                out["tool_calls"].append({"name":name,"args":args,"output":res})
+        return out
+
+# ---- Specialists --------------------------------------------------------
+
+KVA_SYSTEM = """
+You are Kaden's Orchestrator. Break objectives into Research → Writing → Outreach. Return a step plan; do not write final copy yourself.
+"""
+RESEARCHER_SYSTEM = """
+Senior researcher. Return JSON: objective, queries[], findings[], sources[{title,url}].
+"""
+WRITER_SYSTEM = """
+Elite copywriter. Produce Markdown with headline, body, 3 alt hooks.
+"""
+OUTREACH_SYSTEM = """
+SDR/AE. Return JSON: emails(list of {subject,body,cta}), call_script, crm_note.
+"""
+
+# Tool adapters
+
+def t_fetch(args):
+    return web.fetch(args.get("url",""))
+
+KVA = Agent("KVA", KVA_SYSTEM)
+Researcher = Agent("Researcher", RESEARCHER_SYSTEM, tools={"web_fetch": t_fetch})
+Writer = Agent("Writer", WRITER_SYSTEM)
+Outreach = Agent("Outreach", OUTREACH_SYSTEM)
+
+
+def pipeline(goal: str, target: str = "SMB owners") -> Dict[str,str]:
+    r = Researcher.run(task=f"Research for: {goal}. Audience: {target}")
+    research = r["content"]
+    w = Writer.run(task=f"Write copy to accomplish: {goal}", context=research)
+    draft = w["content"]
+    o = Outreach.run(task=f"Create 3‑email sequence + call script for: {target}", context=draft)
+    outreach = o["content"]
+    return {"research": research, "draft": draft, "outreach": outreach}
+
+
+# =========================
+# pricing.py
+# =========================
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class LineItem:
+    name: str
+    qty: int
+    unit_price: float
+    @property
+    def total(self):
+        return self.qty * self.unit_price
+
+@dataclass
+class Service:
+    code: str
+    name: str
+    items: List[LineItem]
+    def total(self):
+        return round(sum(i.total for i in self.items), 2)
+
+CATALOG = {
+    "IG_STARTER": Service(
+        code="IG_STARTER",
+        name="10 Custom IG Posts (Captions + Hashtags + Canva Prompts)",
+        items=[
+            LineItem("Research & Brief", 1, 30.0),
+            LineItem("Copywriting (10 posts)", 10, 6.0),
+            LineItem("Design Prompts", 10, 3.0),
+            LineItem("QA & Delivery", 1, 20.0),
+        ],
+    ),
+    "OUTREACH_3EMAIL": Service(
+        code="OUTREACH_3EMAIL",
+        name="3‑Email Outreach Sequence + Call Script",
+        items=[
+            LineItem("Audience brief", 1, 25.0),
+            LineItem("Email drafts (3)", 3, 18.0),
+            LineItem("Call script", 1, 25.0),
+        ],
+    ),
+}
+
+
+# =========================
+# integrations/notion_sync.py
+# =========================
+from __future__ import annotations
+import os
+from typing import Dict, Any, Optional
+from notion_client import Client
+
+NOTION = Client(auth=os.getenv("NOTION_API_KEY"))
+DB_LEADS = os.getenv("NOTION_DB_LEADS")
+DB_DEALS = os.getenv("NOTION_DB_DEALS")
+DB_CLIENTS = os.getenv("NOTION_DB_CLIENTS")
+
+# Helpers to shape properties
+
+def rich(text: str):
+    return [{"type": "text", "text": {"content": text[:1999]}}]
+
+def to_num(v: float):
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+# Sync functions
+
+def upsert_client(name: str, email: str = None, phone: str = None, meta: Dict[str,Any] = None) -> str:
+    if not DB_CLIENTS:
+        return ""
+    props = {"Name": {"title": rich(name)}}
+    if email: props["Email"] = {"email": email}
+    if phone: props["Phone"] = {"phone_number": phone}
+    if meta: props["Notes"] = {"rich_text": rich(str(meta)[:1900])}
+    page = NOTION.pages.create(parent={"database_id": DB_CLIENTS}, properties=props)
+    return page.get("id","")
+
+def add_lead(name: str, source: str = None, email: str = None, phone: str = None, notes: str = None) -> str:
+    if not DB_LEADS:
+        return ""
+    props = {"Name": {"title": rich(name)}, "Stage": {"select": {"name": "New"}}}
+    if source: props["Source"] = {"select": {"name": source}}
+    if email: props["Email"] = {"email": email}
+    if phone: props["Phone"] = {"phone_number": phone}
+    if notes: props["Notes"] = {"rich_text": rich(notes)}
+    page = NOTION.pages.create(parent={"database_id": DB_LEADS}, properties=props)
+    return page.get("id","")
+
+def add_deal(client_name: str, offer_name: str, amount: float, status: str = "Pending Approval", meta: Dict[str,Any] = None) -> str:
+    if not DB_DEALS:
+        return ""
+    props = {
+        "Deal": {"title": rich(offer_name)},
+        "Client": {"rich_text": rich(client_name)},
+        "Amount": {"number": to_num(amount)},
+        "Status": {"select": {"name": status}},
+    }
+    if meta: props["Details"] = {"rich_text": rich(str(meta)[:1900])}
+    page = NOTION.pages.create(parent={"database_id": DB_DEALS}, properties=props)
+    return page.get("id","")
+
+
+# =========================
+# integrations/sendgrid_mail.py
+# =========================
+from __future__ import annotations
+import os
+from typing import List, Optional
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+
+SG_KEY = os.getenv("SENDGRID_API_KEY")
+SENDER = os.getenv("SENDER_EMAIL")
+
+
+def send_email(to: str, subject: str, html: str, cc: Optional[List[str]] = None) -> bool:
+    if not (SG_KEY and SENDER):
+        print("[email] missing SENDGRID_API_KEY or SENDER_EMAIL — skipping send (dry run)")
+        print(f"TO: {to}\nSUBJECT: {subject}\nHTML:\n{html[:4000]}")
+        return False
+    sg = SendGridAPIClient(SG_KEY)
+    msg = Mail(from_email=SENDER, to_emails=to, subject=subject, html_content=html)
+    if cc:
+        for c in cc:
+            msg.add_cc(c)
+    try:
+        sg.send(msg)
+        return True
+    except Exception as e:
+        print("SendGrid error:", e)
+        return False
+
+
+# =========================
+# auth.py
+# =========================
+from __future__ import annotations
+import os
+from fastapi import APIRouter, Request, Response, HTTPException, Cookie
+from itsdangerous import TimestampSigner, BadSignature, SignatureExpired
+
+router = APIRouter(prefix="/auth", tags=["auth"]) 
+SECRET = os.getenv("APP_SECRET", "change-me")
+signer = TimestampSigner(SECRET)
+ALLOWED_USERNAME = os.getenv("APP_USERNAME", "kadendro")
+COOKIE_NAME = "bv_auth"
+COOKIE_MAX_AGE = 60*60*24*7  # 7 days
+
+@router.post("/login")
+async def login(req: Request):
+    data = await req.json()
+    username = (data.get("username") or "").strip()
+    if username != ALLOWED_USERNAME:
+        raise HTTPException(401, "Unauthorized")
+    token = signer.sign(username.encode()).decode()
+    resp = Response(content='{"ok": true}', media_type="application/json")
+    resp.set_cookie(COOKIE_NAME, token, max_age=COOKIE_MAX_AGE, httponly=True, secure=True, samesite="lax", path="/")
+    return resp
+
+@router.post("/logout")
+async def logout():
+    resp = Response(content='{"ok": true}', media_type="application/json")
+    resp.delete_cookie(COOKIE_NAME, path="/")
+    return resp
+
+async def require_auth(bv_auth: str | None = Cookie(default=None, alias=COOKIE_NAME)):
+    if not bv_auth:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        username = signer.unsign(bv_auth, max_age=COOKIE_MAX_AGE).decode()
+        if username != ALLOWED_USERNAME:
+            raise HTTPException(401, "Invalid user")
+    except (BadSignature, SignatureExpired):
+        raise HTTPException(401, "Invalid session")
+    return True
+
+
+# =========================
+# server.py
+# =========================
+from __future__ import annotations
+import os, hmac, hashlib, base64, json, datetime as dt
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, HTTPException, Request, Depends, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
+import httpx
+
+from auth import router as auth_router, require_auth
+from kv_agents import pipeline
+from pricing import CATALOG
+from integrations.notion_sync import add_deal, add_lead, upsert_client
+from integrations.sendgrid_mail import send_email
+
+load_dotenv()
+app = FastAPI(title="BlackVault API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
+app.include_router(auth_router)
+app.mount("/", StaticFiles(directory="web", html=True), name="web")
+
+# ---- DB ------------------------------------------------------------------
+engine = create_engine("sqlite:///blackvault.db")
+
+class Setting(SQLModel, table=True):
+    key: str = Field(primary_key=True)
+    value: str
+
+class Lead(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    source: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: dt.datetime = Field(default_factory=lambda: dt.datetime.utcnow())
+
+class RunLog(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    goal: str
+    target: str
+    status: str
+    created_at: dt.datetime = Field(default_factory=lambda: dt.datetime.utcnow())
+
+class Client(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
+class Offer(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    client_id: int
+    service_code: str
+    price: float
+    scope_notes: Optional[str] = None
+    status: str = Field(default="pending_approval")
+    research: Optional[str] = None
+    draft: Optional[str] = None
+    outreach: Optional[str] = None
+    notion_deal_id: Optional[str] = None
+
+SQLModel.metadata.create_all(engine)
+
+# ---- Helpers -------------------------------------------------------------
+
+def get(k: str, default: str = "") -> str:
+    with Session(engine) as s:
+        row = s.exec(select(Setting).where(Setting.key == k)).first()
+        return row.value if row else default
+
+def set_(k: str, v: str):
+    with Session(engine) as s:
+        row = s.exec(select(Setting).where(Setting.key == k)).first()
+        if row: row.value = v
+        else: s.add(Setting(key=k, value=v))
+        s.commit()
+
+def square_headers():
+    return {"Authorization": f"Bearer {os.getenv('SQUARE_ACCESS_TOKEN')}", "Content-Type": "application/json"}
+
+async def square_total_today() -> int:
+    """Return today's gross revenue in cents for the configured location."""
+    loc = os.getenv("SQUARE_LOCATION_ID")
+    if not loc:
+        return int(get("square_total_cache","0") or 0)
+    start = dt.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+    async with httpx.AsyncClient(timeout=30) as cx:
+        url = "https://connect.squareup.com/v2/payments"
+        params = {"location_id": loc, "begin_time": start}
+        r = await cx.get(url, headers=square_headers(), params=params)
+        if r.status_code >= 300:
+            return int(get("square_total_cache","0") or 0)
+        data = r.json()
+        cents = 0
+        for p in data.get("payments", []):
+            amt = p.get("amount_money", {}).get("amount", 0)
+            cents += int(amt or 0)
+        set_("square_total_cache", str(cents))
+        return cents
+
+# ---- Scheduler -----------------------------------------------------------
+
+scheduler = BackgroundScheduler()
+
+async def push_toward_target():
+    target = float(get("target_usd", "0") or 0)
+    vertical = get("target_vertical", "SMB owners")
+    if target <= 0:
+        return
+    cents = await square_total_today()
+    if cents >= int(target * 100):
+        return
+    goal = f"Generate qualified leads + outreach for {vertical}; close revenue toward ${target:.0f} today."
+    try:
+        _ = pipeline(goal=goal, target=vertical)
+        with Session(engine) as s:
+            s.add(RunLog(goal=goal, target=vertical, status="completed"))
+            s.commit()
+    except Exception as e:
+        with Session(engine) as s:
+            s.add(RunLog(goal=goal, target=vertical, status=f"error: {e}"))
+            s.commit()
+
+scheduler.add_job(push_toward_target, "interval", minutes=20, id="drive_target", replace_existing=True)
+scheduler.start()
+
+# ---- Schemas -------------------------------------------------------------
+
+class TargetIn(BaseModel):
+    amount_usd: float
+    vertical: str
+
+class AskIn(BaseModel):
+    message: str
+
+class LeadIn(BaseModel):
+    name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    source: Optional[str] = None
+    notes: Optional[str] = None
+
+# ---- Routes (auth‑protected) --------------------------------------------
+
+@app.get("/status")
+async def status(_: bool = Depends(require_auth)):
+    cents = await square_total_today()
+    return {
+        "target_usd": float(get("target_usd","0") or 0),
+        "vertical": get("target_vertical","SMB owners"),
+        "square_today_usd": round(cents/100, 2),
+    }
+
+@app.post("/target")
+async def set_target(inp: TargetIn, _: bool = Depends(require_auth)):
+    set_("target_usd", str(inp.amount_usd))
+    set_("target_vertical", inp.vertical)
+    return {"ok": True}
+
+@app.post("/ask")
+async def ask(inp: AskIn, _: bool = Depends(require_auth)):
+    vertical = get("target_vertical","SMB owners")
+    res = pipeline(goal=inp.message, target=vertical)
+    return res
+
+@app.post("/leads")
+async def add_lead_api(inp: LeadIn, _: bool = Depends(require_auth)):
+    with Session(engine) as s:
+        s.add(Lead(name=inp.name, email=inp.email, phone=inp.phone, source=inp.source, notes=inp.notes))
+        s.commit()
+    try:
+        add_lead(inp.name, inp.source, inp.email, inp.phone, inp.notes)
+    except Exception:
+        pass
+    return {"ok": True}
+
+@app.post("/clients")
+async def create_client(payload: Dict[str,Any] = Body(...), _: bool = Depends(require_auth)):
+    with Session(engine) as s:
+        c = Client(name=payload["name"], email=payload.get("email"), phone=payload.get("phone"))
+        s.add(c); s.commit(); s.refresh(c)
+    try:
+        upsert_client(c.name, c.email, c.phone)
+    except Exception: pass
+    return c
+
+@app.post("/offers")
+async def create_offer(payload: Dict[str,Any] = Body(...), _: bool = Depends(require_auth)):
+    service_code = payload["service_code"]
+    default_price = CATALOG[service_code].total()
+    price = float(payload.get("price", default_price))
+    with Session(engine) as sess:
+        off = Offer(client_id=payload["client_id"], service_code=service_code, price=price, scope_notes=payload.get("scope_notes"))
+        sess.add(off); sess.commit(); sess.refresh(off)
+        goal = f"Fulfill service {service_code} for client_id {off.client_id}"
+        res = pipeline(goal=goal, target=get("target_vertical","SMB owners"))
+        off.research, off.draft, off.outreach = res["research"], res["draft"], res["outreach"]
+        sess.add(off); sess.commit(); sess.refresh(off)
+        try:
+            deal_id = add_deal(client_name=str(off.client_id), offer_name=service_code, amount=off.price, status="Pending Approval")
+            off.notion_deal_id = deal_id; sess.add(off); sess.commit()
+        except Exception:
+            pass
+    return off
+
+@app.post("/offers/{offer_id}/approve")
+async def approve_offer(offer_id: int, _: bool = Depends(require_auth)):
+    with Session(engine) as s:
+        off = s.get(Offer, offer_id)
+        if not off: raise HTTPException(404, "Offer not found")
+        off.status = "approved"; s.add(off); s.commit()
+    return {"ok": True}
+
+@app.post("/offers/{offer_id}/send")
+async def send_offer(offer_id: int, _: bool = Depends(require_auth)):
+    with Session(engine) as s:
+        off = s.get(Offer, offer_id)
+        if not off: raise HTTPException(404, "Offer not found")
+        client = s.get(Client, off.client_id)
+        if not client or not client.email: raise HTTPException(400, "Client email required")
+        html = f"""
+        <h2>Proposal: {off.service_code}</h2>
+        <p>Price: ${off.price:.2f}</p>
+        <hr/>
+        <h3>Scope</h3>
+        <pre>{(off.scope_notes or '').replace('<','&lt;')}</pre>
+        <h3>Deliverables (auto‑generated draft)</h3>
+        <pre>{(off.draft or '').replace('<','&lt;')}</pre>
+        """
+        ok = send_email(client.email, f"Proposal: {off.service_code}", html)
+        if not ok:
+            # still mark as sent in dry-run so you can review in Notion/DB
+            off.status = "sent"; s.add(off); s.commit()
+            return {"ok": True, "note": "Email dry-run (missing SendGrid creds)"}
+        off.status = "sent"; s.add(off); s.commit()
+    return {"ok": True}
+
+# ---- Square webhook ------------------------------------------------------
+
+@app.post("/integrations/square/webhook")
+async def square_webhook(req: Request):
+    sig = req.headers.get("x-square-hmacsha256-signature", "")
+    body = await req.body()
+    key = os.getenv("SQUARE_WEBHOOK_SIGNATURE_KEY", "").encode()
+    if key:
+        digest = base64.b64encode(hmac.new(key, body, hashlib.sha256).digest()).decode()
+        if not hmac.compare_digest(sig, digest):
+            raise HTTPException(401, "Bad signature")
+    payload = json.loads(body.decode())
+    if payload.get("type", "").endswith("payment.created"):
+        set_("square_total_cache", "0")
+    return {"ok": True}
+
+# ---- Run local: uvicorn server:app --reload --port 8000 ------------------
+
+
+# =========================
+# web/index.html
+# =========================
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BlackVault</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <style>
+    body{margin:0;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+    .card{background:#111;border-radius:16px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+    button{border:0;border-radius:12px;padding:10px 14px;background:#fff;color:#000;font-weight:600;cursor:pointer}
+    input,select,textarea{width:100%;background:#1a1a1a;border:1px solid #333;border-radius:10px;color:#fff;padding:10px}
+    .grid{display:grid;gap:16px}
+    @media(min-width:900px){.grid3{grid-template-columns:1fr 1fr 1fr}}
+    a{color:#9cf}
+  </style>
+</head>
+<body>
+  <div id="app" style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">
+    <div id="login" class="card" style="max-width:360px;width:100%">
+      <h2>BlackVault Login</h2>
+      <p style="opacity:.7">Enter username to continue.</p>
+      <input id="username" placeholder="Username" autocomplete="username" />
+      <div style="height:8px"></div>
+      <button onclick="doLogin()">Sign in</button>
+      <div style="height:8px"></div>
+      <small style="opacity:.6">For now, only <b>kadendro</b> is allowed.</small>
+    </div>
+  </div>
+
+  <template id="hub">
+    <div style="max-width:1200px;margin:40px auto;padding:0 16px">
+      <header style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <h1>BLACKVAULT</h1>
+        <div id="rev" style="opacity:.8">—</div>
+        <button onclick="logout()">Logout</button>
+      </header>
+      <div class="grid grid3">
+        <div class="card">
+          <h3>Set Today’s Target</h3>
+          <input id="amount" type="number" placeholder="Amount (USD)" />
+          <div style="height:8px"></div>
+          <select id="vertical">
+            <option>Med Spa</option>
+            <option>Dentist</option>
+            <option>Restaurant</option>
+            <option>Chiro</option>
+            <option>Gym</option>
+            <option>Custom</option>
+          </select>
+          <div style="height:8px"></div>
+          <button onclick="saveTarget()">Save & Start</button>
+          <div style="opacity:.6;margin-top:8px">Agents run every 20 min until Square target is met.</div>
+        </div>
+        <div class="card">
+          <h3>Ask Your Agents</h3>
+          <textarea id="msg" rows="6" placeholder="e.g., Build a Sarasota dentists list and 3-email sequence"></textarea>
+          <div style="height:8px"></div>
+          <button onclick="askAgents()">Send</button>
+        </div>
+        <div class="card">
+          <h3>Quick Links</h3>
+          <p><a href="https://squareup.com/dashboard" target="_blank">Open Square Dashboard</a></p>
+          <p><a href="mailto:you@example.com">Support Email</a></p>
+        </div>
+      </div>
+      <div style="height:16px"></div>
+      <div class="grid grid3">
+        <div class="card"><h4>Research</h4><pre id="research" style="white-space:pre-wrap"></pre></div>
+        <div class="card"><h4>Draft</h4><pre id="draft" style="white-space:pre-wrap"></pre></div>
+        <div class="card"><h4>Outreach</h4><pre id="outreach" style="white-space:pre-wrap"></pre></div>
+      </div>
+      <footer style="opacity:.6;margin-top:20px">© BlackVault</footer>
+    </div>
+  </template>
+
+  <script>
+    const elApp = document.getElementById('app');
+
+    function renderHub(){
+      elApp.innerHTML = document.getElementById('hub').innerHTML;
+      refresh();
+      setInterval(refresh, 15000);
+    }
+
+    async function doLogin(){
+      const username = document.getElementById('username').value.trim();
+      const r = await fetch('/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username})});
+      if(r.ok){ renderHub(); } else { alert('Unauthorized'); }
+    }
+    async function logout(){ await fetch('/auth/logout',{method:'POST'}); location.reload(); }
+
+    async function refresh(){
+      const r = await fetch('/status');
+      if(!r.ok){ return; }
+      const js = await r.json();
+      document.getElementById('rev').textContent = `Square today: $${(js.square_today_usd||0).toFixed(2)} / Target: $${(js.target_usd||0).toFixed(0)}`;
+    }
+    async function saveTarget(){
+      const amount = parseFloat(document.getElementById('amount').value||'0');
+      const vertical = document.getElementById('vertical').value;
+      await fetch('/target', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({amount_usd: amount, vertical})});
+      refresh();
+    }
+    async function askAgents(){
+      const msg = document.getElementById('msg').value;
+      const r = await fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message: msg})});
+      const js = await r.json();
+      document.getElementById('research').textContent = js.research||'';
+      document.getElementById('draft').textContent = js.draft||'';
+      document.getElementById('outreach').textContent = js.outreach||'';
+    }
+
+    // PWA basics
+    if('serviceWorker' in navigator){
+      navigator.serviceWorker.register('/sw.js');
+    }
+  </script>
+</body>
+</html>
+
+
+# =========================
+# web/manifest.webmanifest
+# =========================
+{
+  "name": "BlackVault",
+  "short_name": "BlackVault",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": []
+}
+
+
+# =========================
+# web/sw.js
+# =========================
+self.addEventListener('install', (e)=> self.skipWaiting());
+self.addEventListener('activate', (e)=> self.clients.claim());
