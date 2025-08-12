@@ -1,0 +1,18 @@
+/requirements.txt
+/server.py
+/auth.py
+/kv_agents.py
+/.env.example
+/web/index.html
+/web/manifest.webmanifest
+/web/sw.js
+pip install -r requirements.txt
+pip install -r requirements.txt
+/requirements.txt
+/server.py
+/auth.py
+/kv_agents.py
+/.env.example
+/web/index.html
+/web/manifest.webmanifest
+/web/sw.js
